@@ -1,0 +1,1418 @@
+---
+title: "VAT RNA-seq: differential expression, pathway enrichment and classification (DG vs NG)"
+author: "jmao3cam"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+<!-- ==========================================================================
+Notebook : RNA_11_06_run.Rmd
+Project  : Multi-omics profiling of visceral adipose tissue (VAT) adipocytes in
+           dysglycaemic (DG) vs normoglycaemic (NG) obese women
+Layer    : RNA-seq (transcriptomics)
+Canonical run : outputs written to 11.06.run/
+
+Inputs (place in the working directory):
+  - raw_count.tsv            gene x sample raw counts (ENSEMBL row IDs)
+  - human_gene_names.txt     ENSEMBL -> Gene.name annotation
+  - new_metatable copy.txt   sequencing metadata (Index, Index.1, New.Grouping, Name)
+  - clinical_metadata.xlsx    two-row header clinical table (DG/NG, HbA1c, HOMA-IR, ...)
+
+Key outputs (11.06.run/):
+  - DG_vs_NG_all.txt, cpm.txt, DEG up/down tables
+  - PCA / tSNE / volcano / snoRNA lollipop PDFs
+  - KEGG & GO:BP enrichment tables and dotplots (up/down, ORA on FDR<0.05 set)
+  - cv_rf_roc.pdf (cross-validated random-forest ROC)
+  - SupplementaryFigure5_snoRNA_QC.pdf
+
+Analysis parameters:
+  - DEG (main results) : FDR < 0.05 & |log2FC| > log2(1.5)   -> 210 DEGs (187 up / 23 down)
+  - ORA input set      : FDR < 0.05 only (no FC filter)      -> larger set, distinct from above
+  - Excluded subjects  : 55, 80, 95, 160, 163, 230, 256, 263, 266, 57, 242
+  - MTND1P23 removed from the volcano as a likely technical artefact
+
+NOTE ON REPRODUCIBILITY: run chunks top-to-bottom. `res_df` is created in the
+volcano chunk and reused by later chunks (snoRNA diagnostics, RF, DML cross-ref),
+so those must be run after it.
+=========================================================================== -->
+
+## 1. Data loading + packages
+
+```{r}
+
+# Create the canonical output directory up front so every later ggsave()/write.table()
+# has somewhere to write, regardless of which chunk runs first.
+dir.create("11.06.run", showWarnings = FALSE, recursive = TRUE)
+
+library(readxl)
+library(dplyr)
+library(stringr)
+library(edgeR)
+
+data  <- read.delim("raw_count.tsv", sep = "\t", row.names = 1)
+genes <- read.delim("human_gene_names.txt", sep = "\t", row.names = 1)
+meta  <- read.delim("new_metatable copy.txt", sep = "\t")
+meta  <- meta[order(meta$Index), ]
+
+colnames(data) <- meta$New.Grouping[match(colnames(data), meta$Index.1)]
+data <- data[, !is.na(colnames(data))]
+
+y <- DGEList(counts = data, genes = genes[rownames(data), ])
+y$samples$group   <- as.factor(str_sub(meta$Name, 8,  9))
+y$samples$subject <- as.factor(str_sub(meta$Name, 11, 20))
+
+remove_subjects <- c(55, 80, 95, 160, 163, 230, 256, 263, 266, 57,242)
+keep_idx <- which(!y$samples$subject %in% remove_subjects)
+meta <- meta[keep_idx, ]
+y    <- y[, keep_idx]
+```
+
+## 2. Clinical data loading from excel file
+
+```{r}
+library(readxl)
+library(dplyr)
+
+# ── Load + clean in one pass ──────────────────────────────────────────────────
+clin_raw  <- read_excel("clinical_metadata.xlsx", col_names = FALSE, skip = 0)
+top       <- as.character(clin_raw[1, ])
+sub       <- as.character(clin_raw[2, ])
+
+for (i in seq_along(top)) {
+  if (is.na(top[i]) || top[i] == "NA") top[i] <- top[i - 1]
+}
+
+col_names <- ifelse(is.na(sub) | sub == "NA" | sub == top,
+                    top, paste(top, sub, sep = "_"))
+col_names <- make.names(col_names, unique = TRUE)
+
+clinical  <- read_excel("clinical_metadata.xlsx", skip = 2, col_names = col_names) %>%
+  rename(
+    sample_id       = Sample.ID,
+    group_clin      = Group,
+    subject         = Subject,
+    sex             = Sex,
+    age             = Age,
+    height          = Height,
+    weight          = Weight,
+    bmi             = BMI,
+    smoking         = Smoking.Habits,
+    cigs_day        = Smoking.Habits_Cigs.day,
+    drinking        = Drinking.Habits,
+    sbp             = Blood.Pressure_SBP,
+    dbp             = Blood.Pressure_DBP,
+    heart_rate      = Heart.Rate,
+    rx_metformin    = Rx.T2D_Metformin,
+    rx_insulin      = Rx.T2D_Insulin,
+    rx_dpp4         = Rx.T2D_DPP4.inhib.,
+    rx_sglt2        = Rx.T2D_SGLT2.inhib.,
+    rx_glp1         = Rx.T2D_GLP.1R.agonists,
+    rx_sulfonylurea = Rx.T2D_Sulfonylureas,
+    rx_other_t2d    = Rx.T2D_Other.drugs,
+    rx_highbp       = Rx.High.BP,
+    rx_statins      = Rx.Dyslipidemia,
+    rx_other        = Rx.Other,
+    hemoglobin      = Hemoglobin,
+    glucose         = Glucose,
+    hba1c_pct       = HbA1c,
+    total_chol      = Total.Cholesterol,
+    hdl             = HDL,
+    ldl             = LDL,
+    triglycerides   = Triglycerides,
+    ast             = AST,
+    alt             = ALT,
+    ggt             = Gama.GT,
+    alk_phos        = Alkaline.phosphatase,
+    total_protein   = Total.Protein,
+    albumin         = Albumine,
+    tsh             = TSH,
+    insulin_uU      = Insulin,
+    peptide_c       = Peptide.C,
+    homa_ir         = HOMA.Insulin.Resistance
+  ) %>%
+  mutate(
+    subject    = trimws(as.character(as.integer(subject))),
+    group_clin = as.factor(group_clin),
+    sex        = as.factor(sex),
+    bmi        = as.numeric(bmi),
+    age        = as.numeric(age),
+    glucose    = as.numeric(glucose),
+    hba1c_pct  = as.numeric(hba1c_pct),
+    homa_ir    = as.numeric(homa_ir),
+    sbp        = as.numeric(sbp),
+    dbp        = as.numeric(dbp),
+    treatment  = as.factor(ifelse(
+      rx_metformin == 1 | rx_insulin == 1 | rx_dpp4 == 1 | rx_sglt2 == 1 |
+      rx_glp1 == 1 | rx_sulfonylurea == 1 | rx_other_t2d == 1,
+      "Treatment", "No treatment"
+    ))
+  )
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Subjects:", head(clinical$subject), "\n")
+cat("Treatment breakdown:\n")
+print(table(clinical$treatment, clinical$group_clin))
+```
+
+### Treatment vs no treatment group separation
+
+```{r}
+clinical <- clinical %>%
+  mutate(
+    treatment = as.factor(ifelse(
+      rx_metformin == 1 | rx_insulin == 1 | rx_dpp4 == 1 | rx_sglt2 == 1 |
+      rx_glp1 == 1 | rx_sulfonylurea == 1 | rx_other_t2d == 1 ,
+      "Treatment", "No treatment"
+    ))
+  )
+
+cat("Treatment group breakdown:\n")
+print(table(clinical$treatment, clinical$group_clin))
+```
+
+## 3. Filter and normalisation of the data
+
+gene must be expressed in at least as many samples as the smallest group (32)
+
+```{r}
+# 7. Filter, normalise, dispersion 
+keep <- rowSums(cpm(y) >= 1) >= 32
+y    <- y[keep, , keep.lib.size = FALSE]
+y    <- calcNormFactors(y)
+nrow(y)
+
+design <- model.matrix(~0 + y$samples$group)
+colnames(design) <- c("DG", "NG")
+
+```
+
+```{r}
+## PCA on filtered, normalised RNA-seq data
+
+library(ggplot2)
+
+logcpm_pca <- cpm(y, log = TRUE, prior.count = 1)
+mat_pca    <- t(logcpm_pca)
+
+pca_out <- prcomp(mat_pca, center = TRUE, scale. = FALSE)
+var_explained <- round(100 * (pca_out$sdev^2) / sum(pca_out$sdev^2), 1)
+
+plot_df_pca <- data.frame(
+  PC1     = pca_out$x[, 1],
+  PC2     = pca_out$x[, 2],
+  group   = y$samples$group,
+  subject = y$samples$subject
+)
+
+if (exists("clinical")) {
+  plot_df_pca$subject <- as.character(plot_df_pca$subject)
+  clinical$subject     <- as.character(clinical$subject)
+  plot_df_pca <- left_join(plot_df_pca, clinical[, c("subject", "treatment")], by = "subject")
+  plot_df_pca$treatment[is.na(plot_df_pca$treatment)] <- "Unknown"
+}
+
+x_lim <- max(abs(plot_df_pca$PC1), na.rm = TRUE) * 1.05
+y_lim <- max(abs(plot_df_pca$PC2), na.rm = TRUE) * 1.05
+
+p_pca <- ggplot(plot_df_pca, aes(x = PC1, y = PC2, colour = group)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0"),
+                      labels = c("DG" = "Dysglycaemic", "NG" = "Normoglycaemic")) +
+  scale_x_continuous(limits = c(-x_lim, x_lim)) +
+  scale_y_continuous(limits = c(-y_lim, y_lim)) +
+  labs(title  = "PCA - VAT RNA-seq (filtered, TMM-normalised)",
+       x      = paste0("PC1 (", var_explained[1], "%)"),
+       y      = paste0("PC2 (", var_explained[2], "%)"),
+       colour = "Group") +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle   = element_text(hjust = 0.5, colour = "grey40", size = 10),
+    axis.title      = element_text(size = 12),
+    axis.text       = element_text(size = 10.5, colour = "grey20"),
+    legend.text     = element_text(size = 10.5),
+    plot.margin     = ggplot2::margin(10, 20, 10, 10)
+  )
+
+print(p_pca)
+ggsave("11.06.run/pca_DG_vs_NG.pdf", p_pca, width = 10, height = 6)
+```
+
+
+## tSNE on filtered, normalised RNA-seq data
+Shows group separation
+```{r}
+## tSNE on filtered, normalised RNA-seq data
+
+library(Rtsne)
+library(ggplot2)
+
+# ── Get log2-CPM matrix (samples as rows) ───────────────────────────────────
+logcpm <- cpm(y, log = TRUE, prior.count = 1)
+mat    <- t(logcpm)   # samples x genes
+
+# ── Run tSNE ────────────────────────────────────────────────────────────────
+set.seed(20)
+tsne_out <- Rtsne(mat,
+                  dims        = 2,
+                  perplexity  = 10,   # ~sqrt(n_samples); adjust if needed
+                  max_iter    = 1000,
+                  pca         = TRUE,
+                  pca_center  = TRUE,
+                  pca_scale   = FALSE,
+                  verbose     = FALSE)
+
+# ── Build plot data frame ────────────────────────────────────────────────────
+plot_df <- data.frame(
+  tSNE1   = tsne_out$Y[, 1],
+  tSNE2   = tsne_out$Y[, 2],
+  group   = y$samples$group,
+  subject = y$samples$subject
+)
+
+# Optionally merge treatment info if clinical is available
+if (exists("clinical")) {
+  plot_df$subject <- as.character(plot_df$subject)
+  clinical$subject <- as.character(clinical$subject)
+  plot_df <- left_join(plot_df, clinical[, c("subject", "treatment")], by = "subject")
+  plot_df$treatment[is.na(plot_df$treatment)] <- "Unknown"
+}
+
+# ── Plot ─────────────────────────────────────────────────────────────────────
+p <- ggplot(plot_df, aes(x = tSNE1, y = tSNE2, colour = group)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0"),
+                      labels = c("DG" = "Dysglycaemic", "NG" = "Normoglycaemic")) +
+  labs(title   = "tSNE - VAT RNA-seq (filtered, TMM-normalised)",
+       x       = "tSNE 1",
+       y       = "tSNE 2",
+       colour  = "Group") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+# ── Optional: colour by treatment status ────────────────────────────────────
+if ("treatment" %in% colnames(plot_df)) {
+  p2 <- ggplot(plot_df, aes(x = tSNE1, y = tSNE2,
+                             colour = group, shape = treatment)) +
+    geom_point(size = 3, alpha = 0.85) +
+    scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+    labs(title  = "tSNE - coloured by group, shaped by treatment",
+         colour = "Group", shape = "Treatment") +
+    theme_bw(base_size = 13) +
+    theme(legend.position = "right",
+          plot.title = element_text(hjust = 0.5))
+  print(p2)
+}
+```
+
+## Statistical tests 
+### Uses glmFit/glmLRT
+
+```{r}
+# ── 8. Fit & test DG vs NG ────────────────────────────────────────────────────
+y    <- estimateDisp(y, design)
+fit  <- glmFit(y, design)
+DG_vs_NG <- glmLRT(fit, contrast = c(1, -1))
+
+cat("\nDEG table:\n")
+print(table(decideTests(DG_vs_NG)))
+
+write.table(topTags(DG_vs_NG, n = Inf),
+            "DG_vs_NG.txt", sep = "\t", quote = FALSE, col.names = NA)
+
+# ── 9. CPM export ─────────────────────────────────────────────────────────────
+log_cpm <- cpm(y, log = FALSE)
+log_cpm <- log2(log_cpm + 1)
+# colnames are already correct from y — don't overwrite with meta
+log_cpm <- merge(log_cpm, genes, by = 0, all.x = TRUE)
+write.table(log_cpm, "cpm.txt", sep = "\t", quote = FALSE, col.names = NA)
+#save the table with all the data 
+res <- topTags(DG_vs_NG, n = Inf)$table
+write.table(res, "DG_vs_NG_all.txt", sep = "\t", quote = FALSE, col.names = NA)
+```
+### All DEGs
+
+```{r}
+all_degs <- res %>%
+  filter(FDR < 0.05 & abs(logFC) > log2(1.5)) %>%
+  arrange(FDR) %>%
+  mutate(
+    FC        = round(logFC, 2),
+    FDR       = formatC(FDR, format = "e", digits = 2),
+    Direction = ifelse(logFC > 0, "Up", "Down")
+  ) %>%
+  dplyr::select(Gene = Gene.name, FC, Direction, FDR)
+
+print(all_degs, row.names = FALSE)
+cat("Total DEGs:", nrow(all_degs), "\n")
+```
+
+### Gene Upregulation or Downregulation
+
+```{r}
+# ── Create output folder ──────────────────────────────────────────────────────
+dir.create("11.06.run", showWarnings = FALSE)
+
+# ── DEG classification ────────────────────────────────────────────────────────
+res <- topTags(DG_vs_NG, n = Inf)$table
+
+res$DEG <- ifelse(res$FDR < 0.05 & abs(res$logFC) > 0.58,
+                  ifelse(res$logFC > 0, "Upregulated", "Downregulated"),
+                  "Not Significant")
+
+# ── Summary table ─────────────────────────────────────────────────────────────
+print(table(res$DEG))
+
+# ── Split up/down ─────────────────────────────────────────────────────────────
+up   <- res[res$DEG == "Upregulated",   ] |> arrange(FDR)
+down <- res[res$DEG == "Downregulated", ] |> arrange(FDR)
+
+cat("Upregulated:", nrow(up), "| Downregulated:", nrow(down), "\n")
+
+# ── Export ────────────────────────────────────────────────────────────────────
+write.table(up,                                  "11.06.run/DG_vs_NG_upregulated.txt",   sep = "\t", quote = FALSE, col.names = NA)
+write.table(down,                                "11.06.run/DG_vs_NG_downregulated.txt", sep = "\t", quote = FALSE, col.names = NA)
+write.table(res[res$DEG != "Not Significant", ], "11.06.run/DG_vs_NG_DEGs_all.txt",      sep = "\t", quote = FALSE, col.names = NA)
+```
+
+## KEGG and GO pathway enrichment analysis
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# ── 1. Get significant DEGs ───────────────────────────────────────────────────
+sig_genes <- res[res$FDR < 0.05, ]
+sig_genes$ENSEMBL <- rownames(sig_genes)
+
+# ── 2. Map ENSEMBL to Entrez IDs ─────────────────────────────────────────────
+entrez <- bitr(sig_genes$ENSEMBL,
+               fromType = "ENSEMBL",
+               toType   = "ENTREZID",
+               OrgDb    = org.Hs.eg.db)
+
+sig_merged <- merge(sig_genes, entrez, by = "ENSEMBL")
+cat("DEGs mapped to Entrez IDs:", nrow(sig_merged), "\n")
+
+# ── 3. KEGG enrichment ────────────────────────────────────────────────────────
+kegg_res <- enrichKEGG(
+  gene         = sig_merged$ENTREZID,
+  organism     = "hsa",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2
+)
+
+cat("Significant KEGG pathways:", nrow(kegg_res@result[kegg_res@result$p.adjust < 0.05, ]), "\n")
+write.table(as.data.frame(kegg_res), "11.06.run/KEGG_enrichment_results.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+
+# ── 4. GO Biological Process enrichment ──────────────────────────────────────
+go_bp <- enrichGO(
+  gene         = sig_merged$ENTREZID,
+  OrgDb        = org.Hs.eg.db,
+  ont          = "BP",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable     = TRUE
+)
+
+write.table(as.data.frame(go_bp), "11.06.run/GO_BP_enrichment_results.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+### KEGG and GO tables
+
+```{r}
+library(knitr)
+library(kableExtra)
+
+# ── KEGG table ────────────────────────────────────────────────────────────────
+kegg_top20 <- as.data.frame(kegg_res) %>%
+  arrange(p.adjust) %>%
+  head(20) %>%
+  mutate(
+    Rank      = row_number(),
+    FDR       = formatC(p.adjust, format = "e", digits = 2),
+    GeneRatio = GeneRatio
+  ) %>%
+  dplyr::select(Rank, Pathway = Description, GeneRatio, FDR)
+
+# ── GO BP table ───────────────────────────────────────────────────────────────
+go_top20 <- as.data.frame(go_bp) %>%
+  arrange(p.adjust) %>%
+  head(20) %>%
+  mutate(
+    Rank      = row_number(),
+    FDR       = formatC(p.adjust, format = "e", digits = 2),
+    GeneRatio = GeneRatio
+  ) %>%
+  dplyr::select(Rank, Pathway = Description, GeneRatio, FDR)
+
+# ── Print as styled tables ────────────────────────────────────────────────────
+kegg_top20 %>%
+  kbl(caption = "Top 20 KEGG Pathways — DG vs NG", align = c("c","l","c","c")) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2C3E50", color = "white") %>%
+  column_spec(1, width = "2em", bold = TRUE) %>%
+  column_spec(2, width = "20em") %>%
+  save_kable("11.06.run/KEGG_top20_table.html")
+
+go_top20 %>%
+  kbl(caption = "Top 20 GO Biological Processes — DG vs NG", align = c("c","l","c","c")) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2C3E50", color = "white") %>%
+  column_spec(1, width = "2em", bold = TRUE) %>%
+  column_spec(2, width = "20em") %>%
+  save_kable("11.06.run/GO_BP_top20_table.html")
+```
+
+## Volcano plot of DEGs 
+
+```{r}
+library(ggrepel)
+res_df <- as.data.frame(topTags(DG_vs_NG, n = Inf)$table)
+res_df[] <- lapply(res_df, function(x) if (is(x, "Rle")) as.vector(x) else x)
+res_df <- res_df[res_df$Gene.name != "MTND1P23", ]
+
+volcano_df <- res_df %>%
+  mutate(
+    neg_log10_FDR = -log10(FDR),
+    significance  = case_when(
+      FDR < 0.05 & logFC >  log2(1.5) ~ "Up",
+      FDR < 0.05 & logFC < -log2(1.5) ~ "Down",
+      TRUE                             ~ "NS"
+    )
+  )
+
+top_fc_genes <- volcano_df %>%
+  filter(significance != "NS") %>%
+  group_by(significance) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  pull(Gene.name)
+
+volcano_df <- volcano_df %>%
+  mutate(label = ifelse(Gene.name %in% top_fc_genes, Gene.name, NA_character_))
+
+n_up   <- sum(volcano_df$significance == "Up")
+n_down <- sum(volcano_df$significance == "Down")
+
+# symmetric x-limits with a bit of breathing room
+x_lim <- max(abs(volcano_df$logFC), na.rm = TRUE) * 1.05
+
+p_volcano <- ggplot(volcano_df, aes(x = logFC, y = neg_log10_FDR, colour = significance)) +
+  geom_point(aes(size = significance), alpha = 0.6) +
+  geom_text_repel(
+    aes(label = label),
+    size          = 3,
+    max.overlaps  = 20,
+    box.padding   = 0.4,
+    segment.color = "grey50",
+    na.rm         = TRUE
+  ) +
+  geom_vline(xintercept = c(-log2(1.5), log2(1.5)),
+             linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  scale_colour_manual(
+    values = c("Up" = "#D94F3D", "Down" = "#4C72B0", "NS" = "grey70"),
+    labels = c("Up"   = paste0("Up (", n_up, ")"),
+               "Down" = paste0("Down (", n_down, ")"),
+               "NS"   = "Not significant")
+  ) +
+  scale_size_manual(values = c("Up" = 1.8, "Down" = 1.8, "NS" = 0.8),
+                    guide = "none") +
+  scale_x_continuous(limits = c(-x_lim, x_lim)) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title    = "Differential gene expression - DG vs NG",
+    subtitle = "FDR < 0.05 & |FC| > 1.5",
+    x        = "log2 Fold Change (DG/NG)",
+    y        = "-log10(FDR)",
+    colour   = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position   = c(0.08, 0.88),
+    legend.background = element_blank(),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle     = element_text(hjust = 0.5, colour = "grey40", size = 13),
+    axis.title        = element_text(size = 15),
+    axis.text         = element_text(size = 12.5, colour = "grey20"),
+    legend.text       = element_text(size = 12.5),
+    plot.margin       = margin(10, 20, 10, 10)
+  )
+
+print(p_volcano)
+
+ggsave("11.06.run/volcano_DG_vs_NG.pdf", p_volcano, width = 12, height = 6)
+```
+
+
+```{r}
+library(dplyr)
+library(gridExtra)
+library(grid)
+
+kegg_selected <- c("Carbon metabolism", "Citrate cycle (TCA cycle)",
+                   "AMPK signaling pathway", "Diabetic cardiomyopathy", "Insulin signaling pathway")
+
+go_selected <- c("generation of precursor metabolites and energy",
+                 "cellular respiration",
+                 "MHC class II protein complex assembly")
+
+kegg_table <- as.data.frame(kegg_res) %>%
+  filter(Description %in% kegg_selected) %>%
+  arrange(p.adjust) %>%
+  mutate(FDR = formatC(p.adjust, format = "e", digits = 2),
+         Database = "KEGG") %>%
+  dplyr::select(Database, Pathway = Description, GeneRatio, FDR)
+
+go_table <- as.data.frame(go_bp) %>%
+  filter(Description %in% go_selected) %>%
+  arrange(p.adjust) %>%
+  mutate(FDR = formatC(p.adjust, format = "e", digits = 2),
+         Database = "GO:BP") %>%
+  dplyr::select(Database, Pathway = Description, GeneRatio, FDR)
+
+combined <- bind_rows(kegg_table, go_table)
+
+pdf("11.06.run/selected_pathways_table.pdf", width = 11, height = 5)
+
+tt <- ttheme_default(
+  core = list(
+    bg_params = list(
+      fill = c(rep(c("#EAF2FB", "white"), length.out = nrow(kegg_table)),
+               rep(c("#EAF8F1", "white"), length.out = nrow(go_table))),
+      col = "grey85"
+    ),
+    fg_params = list(fontsize = 10, hjust = 0, x = 0.05)
+  ),
+  colhead = list(
+    bg_params = list(fill = "#2C3E50", col = NA),
+    fg_params = list(fontsize = 11, fontface = "bold", col = "white",
+                     hjust = 0, x = 0.05)
+  )
+)
+
+tbl <- tableGrob(combined, rows = NULL, theme = tt)
+
+# Add section separating line between KEGG and GO
+grid.newpage()
+grid.arrange(
+  tbl,
+  top = textGrob("Enriched Pathways - DG vs NG",
+                 gp = gpar(fontsize = 14, fontface = "bold")),
+  padding = unit(1, "cm")
+)
+
+dev.off()
+```
+```{r}
+top_gene   <- "SNORA26"
+gene_ensid <- rownames(res_df)[res_df$Gene.name == top_gene][1]
+
+logcpm <- cpm(y, log = TRUE, prior.count = 1)
+
+plot_df_deg <- data.frame(
+  logCPM = as.numeric(logcpm[gene_ensid, ]),
+  Group  = y$samples$group
+)
+
+ggplot(plot_df_deg, aes(x = Group, y = logCPM, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.7,
+               colour = "grey30", linewidth = 0.6) +
+  geom_jitter(aes(colour = Group), width = 0.12, size = 2.5,
+              alpha = 0.85, show.legend = FALSE) +
+  scale_fill_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0"),
+                    labels = c("DG" = "Dysglycaemic", "NG" = "Normoglycaemic")) +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  scale_x_discrete(labels = c("DG" = "Dysglycaemic", "NG" = "Normoglycaemic")) +
+  labs(
+    title = "SNORA26 Expression",
+    x     = NULL,
+    y     = "log2-CPM",
+    fill  = NULL
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold.italic", size = 17),
+    legend.position = "none",
+    axis.text.x     = element_text(size = 14, colour = "grey20"),
+    axis.text.y     = element_text(size = 13),
+    axis.title.y    = element_text(size = 14)
+  )
+
+ggsave("11.06.run/boxplot_SNORA26_expression.pdf", width = 4.5, height = 5.5)
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# ── Use corrected threshold ────────────────────────────────────────────────
+sig_up   <- res_df[res_df$FDR < 0.05 & res_df$logFC > 0, ]
+sig_down <- res_df[res_df$FDR < 0.05 & res_df$logFC < 0, ]
+
+cat("Upregulated DEGs:  ", nrow(sig_up), "\n")
+cat("Downregulated DEGs:", nrow(sig_down), "\n")
+
+# ── Map ENSEMBL to Entrez ─────────────────────────────────────────────────
+map_entrez <- function(df) {
+  df$ENSEMBL <- rownames(df)
+  entrez <- bitr(df$ENSEMBL, fromType = "ENSEMBL",
+                 toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  merge(df, entrez, by = "ENSEMBL")
+}
+
+up_mapped   <- map_entrez(sig_up)
+down_mapped <- map_entrez(sig_down)
+
+# ── KEGG enrichment ───────────────────────────────────────────────────────
+kegg_up <- enrichKEGG(gene = up_mapped$ENTREZID, organism = "hsa",
+                      pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+
+kegg_down <- enrichKEGG(gene = down_mapped$ENTREZID, organism = "hsa",
+                        pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+
+# ── GO:BP enrichment ──────────────────────────────────────────────────────
+go_up <- enrichGO(gene = up_mapped$ENTREZID, OrgDb = org.Hs.eg.db,
+                  ont = "BP", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+                  readable = TRUE)
+
+go_down <- enrichGO(gene = down_mapped$ENTREZID, OrgDb = org.Hs.eg.db,
+                    ont = "BP", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+                    readable = TRUE)
+
+# ── Print summaries ───────────────────────────────────────────────────────
+cat("\nKEGG - Upregulated:", nrow(as.data.frame(kegg_up)), "pathways\n")
+cat("KEGG - Downregulated:", nrow(as.data.frame(kegg_down)), "pathways\n")
+cat("GO:BP - Upregulated:", nrow(as.data.frame(go_up)), "terms\n")
+cat("GO:BP - Downregulated:", nrow(as.data.frame(go_down)), "terms\n")
+
+# ── Top 10 per direction ──────────────────────────────────────────────────
+cat("\nTop KEGG - Upregulated:\n")
+print(as.data.frame(kegg_up) %>% arrange(p.adjust) %>% head(10) %>%
+        dplyr::select(Description, GeneRatio, p.adjust))
+
+cat("\nTop KEGG - Downregulated:\n")
+print(as.data.frame(kegg_down) %>% arrange(p.adjust) %>% head(10) %>%
+        dplyr::select(Description, GeneRatio, p.adjust))
+
+cat("\nTop GO:BP - Upregulated:\n")
+print(as.data.frame(go_up) %>% arrange(p.adjust) %>% head(10) %>%
+        dplyr::select(Description, GeneRatio, p.adjust))
+
+cat("\nTop GO:BP - Downregulated:\n")
+print(as.data.frame(go_down) %>% arrange(p.adjust) %>% head(10) %>%
+        dplyr::select(Description, GeneRatio, p.adjust))
+
+# ── Export ────────────────────────────────────────────────────────────────
+write.table(as.data.frame(kegg_up),   "11.06.run/KEGG_upregulated.txt",   sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(kegg_down), "11.06.run/KEGG_downregulated.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(go_up),     "11.06.run/GO_BP_upregulated.txt",  sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(go_down),   "11.06.run/GO_BP_downregulated.txt",sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(gridExtra)
+library(grid)
+
+# ── Selected pathways from corrected analysis ──────────────────────────────
+kegg_selected_up <- c("Systemic lupus erythematosus", "Asthma",
+                      "Intestinal immune network for IgA production",
+                      "Antigen processing and presentation",
+                      "Type I diabetes mellitus")
+
+go_selected_up <- c("antigen processing and presentation of exogenous peptide antigen",
+                    "antigen processing and presentation of peptide antigen via MHC class II",
+                    "MHC class II protein complex assembly")
+
+kegg_table <- as.data.frame(kegg_up) %>%
+  filter(Description %in% kegg_selected_up) %>%
+  arrange(p.adjust) %>%
+  mutate(FDR      = formatC(p.adjust, format = "e", digits = 2),
+         Database = "KEGG") %>%
+  dplyr::select(Database, Pathway = Description, GeneRatio, FDR)
+
+go_table <- as.data.frame(go_up) %>%
+  filter(Description %in% go_selected_up) %>%
+  arrange(p.adjust) %>%
+  mutate(FDR      = formatC(p.adjust, format = "e", digits = 2),
+         Database = "GO:BP") %>%
+  dplyr::select(Database, Pathway = Description, GeneRatio, FDR)
+
+combined <- bind_rows(kegg_table, go_table)
+
+# ── Table theme ────────────────────────────────────────────────────────────
+tt <- ttheme_default(
+  core = list(
+    bg_params = list(
+      fill = c(rep(c("#EAF2FB", "white"), length.out = nrow(kegg_table)),
+               rep(c("#EAF8F1", "white"), length.out = nrow(go_table))),
+      col = "grey85"
+    ),
+    fg_params = list(fontsize = 10, hjust = 0, x = 0.05)
+  ),
+  colhead = list(
+    bg_params = list(fill = "#2C3E50", col = NA),
+    fg_params = list(fontsize = 11, fontface = "bold", col = "white",
+                     hjust = 0, x = 0.05)
+  )
+)
+
+pdf("11.06.run/selected_pathways_table_corrected.pdf", width = 11, height = 5)
+grid.newpage()
+grid.arrange(
+  tableGrob(combined, rows = NULL, theme = tt),
+  top = textGrob("Enriched Pathways - Upregulated DEGs (FDR<0.05)",
+                 gp = gpar(fontsize = 14, fontface = "bold")),
+  padding = unit(1, "cm")
+)
+dev.off()
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+make_enrich_plot <- function(enrich_obj, title, fill_colour, n = 10) {
+  df <- as.data.frame(enrich_obj) %>%
+    arrange(p.adjust) %>%
+    head(n) %>%
+    mutate(
+      Description   = stringr::str_wrap(Description, width = 40),
+      Description   = factor(Description, levels = rev(Description)),
+      gene_count    = as.numeric(sub("/.*", "", GeneRatio)),
+      neg_log10_fdr = -log10(p.adjust)
+    )
+  
+  ggplot(df, aes(x = neg_log10_fdr, y = Description)) +
+    geom_col(fill = fill_colour, alpha = 0.85, width = 0.7) +
+    geom_point(aes(size = gene_count), colour = "grey20", alpha = 0.8) +
+    scale_size_continuous(name = "Gene count", range = c(2, 6)) +
+    labs(title = title, x = "-log10(FDR)", y = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title   = element_text(face = "bold", size = 11, hjust = 0),
+      axis.text.y  = element_text(size = 9),
+      axis.text.x  = element_text(size = 9),
+      legend.position = "right"
+    )
+}
+
+p1 <- make_enrich_plot(kegg_up,   "KEGG — Upregulated",   "#E8534A")
+p2 <- make_enrich_plot(kegg_down, "KEGG — Downregulated", "#4C72B0")
+p3 <- make_enrich_plot(go_up,     "GO:BP — Upregulated",  "#E8534A")
+p4 <- make_enrich_plot(go_down,   "GO:BP — Downregulated","#4C72B0")
+
+combined <- (p1 | p2) / (p3 | p4) +
+  plot_annotation(
+    title    = "Pathway enrichment — DG vs NG",
+    subtitle = "Top 10 terms by FDR, ORA (FDR < 0.05)",
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5, colour = "grey40")
+    )
+  )
+
+ggsave("11.06.run/enrichment_plots.pdf", combined, width = 14, height = 12)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# ── Extract all snoRNAs from DEGs ─────────────────────────────────────────
+snorna_df <- res_df %>%
+  filter(FDR < 0.05 & logFC > log2(1.5)) %>%
+  filter(grepl("^SNORA|^SNORD|^SCARNA", Gene.name)) %>%
+  arrange(desc(logFC)) %>%
+  mutate(Gene.name = factor(Gene.name, levels = Gene.name[order(logFC)]))
+
+cat("Total snoRNAs in upregulated DEGs:", nrow(snorna_df), "\n")
+print(snorna_df[, c("Gene.name", "logFC", "FDR")])
+
+# ── Lollipop plot ─────────────────────────────────────────────────────────
+ggplot(snorna_df, aes(x = logFC, y = Gene.name)) +
+  geom_segment(aes(x = 0, xend = logFC, yend = Gene.name),
+               linewidth = 0.8, colour = "#E8534A") +
+  geom_point(size = 3.5, colour = "#E8534A") +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey30") +
+  scale_x_continuous(limits = c(0, NA),
+                     breaks = seq(0, 2, by = 0.5)) +
+  labs(
+    title    = "Upregulated snoRNAs in DG VAT",
+    subtitle = "FDR < 0.05 & |FC| > 1.5",
+    x        = "log2 Fold Change (DG/NG)",
+    y        = NULL
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40", size = 10),
+    axis.text.y   = element_text(face = "italic", size = 11),
+    axis.text.x   = element_text(size = 11),
+    axis.title.x  = element_text(size = 12),
+    panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.3)
+  )
+
+ggsave("11.06.run/lollipop_snoRNAs_upregulated.pdf", width = 6, height = 7)
+```
+
+```{r cv-rf-rnaseq, warning=FALSE, message=FALSE}
+library(randomForest)
+library(pROC)
+
+set.seed(42)
+
+n_folds   <- 5
+n_repeats <- 10
+n_top_genes <- 50   # same number as your original top-50-DEG classifier
+
+group_labels <- y$samples$group  # factor: DG / NG
+n_samples    <- length(group_labels)
+
+# Storage for pooled out-of-fold predictions across all repeats
+all_true  <- character(0)
+all_probs <- numeric(0)
+
+for (rep_i in seq_len(n_repeats)) {
+
+  set.seed(100 + rep_i)
+
+  # Stratified fold assignment: shuffle within each group separately so
+  # DG/NG proportions stay balanced across folds despite the 33/32 split
+  fold_id <- integer(n_samples)
+  for (g in levels(group_labels)) {
+    idx <- which(group_labels == g)
+    idx <- sample(idx)  # shuffle
+    fold_id[idx] <- rep(seq_len(n_folds), length.out = length(idx))
+  }
+
+  for (k in seq_len(n_folds)) {
+    test_idx  <- which(fold_id == k)
+    train_idx <- which(fold_id != k)
+
+    # ── Re-run DE testing using ONLY the training fold ─────────────────────
+    y_train <- y[, train_idx]
+    y_train <- calcNormFactors(y_train)  # re-normalise on training data only
+
+    design_train <- model.matrix(~0 + y_train$samples$group)
+    colnames(design_train) <- levels(y_train$samples$group)
+
+    y_train <- estimateDisp(y_train, design_train)
+    fit_train <- glmFit(y_train, design_train)
+    lrt_train <- glmLRT(fit_train, contrast = c(1, -1))
+
+    top_genes <- rownames(topTags(lrt_train, n = n_top_genes)$table)
+
+    # ── Build train/test feature matrices from the SAME normalised CPMs ────
+    logcpm_all <- cpm(y, log = TRUE, prior.count = 1)
+
+    train_x <- t(logcpm_all[top_genes, train_idx, drop = FALSE])
+    test_x  <- t(logcpm_all[top_genes, test_idx,  drop = FALSE])
+
+    train_y <- factor(group_labels[train_idx])  # force factor, in case it was coerced
+    test_y  <- factor(group_labels[test_idx])
+
+    rf_fold <- randomForest::randomForest(x = train_x, y = train_y, ntree = 500)
+
+    # Diagnostic (uncomment if the error recurs, to confirm root cause):
+    # cat("class:", class(rf_fold), "| type:", rf_fold$type, "\n")
+
+    # Call the classification predict method explicitly rather than the
+    # bare generic predict() — this avoids dispatch ambiguity if another
+    # loaded package (clusterProfiler/AnnotationDbi both loaded earlier in
+    # this notebook mask a number of generics) has shadowed the intended
+    # predict.randomForest method.
+    fold_probs <- randomForest:::predict.randomForest(rf_fold, newdata = test_x,
+                                                       type = "prob")[, "DG"]
+
+    all_true  <- c(all_true,  as.character(test_y))
+    all_probs <- c(all_probs, fold_probs)
+  }
+}
+
+# ── Pooled ROC/AUC across every held-out prediction from every fold/repeat ──
+roc_cv <- pROC::roc(all_true, all_probs, levels = c("NG", "DG"), direction = "<")
+
+cat("Cross-validated RNA-seq RF AUC (top", n_top_genes, "genes, refit per fold):",
+    round(auc(roc_cv), 3), "\n")
+cat("(", n_repeats, "repeats x", n_folds, "folds =", length(all_true), "pooled predictions)\n")
+
+pdf(file.path("11.06.run", "cv_rf_roc.pdf"), width = 5, height = 5)
+plot(roc_cv, col = "#D94F3D", lwd = 2,
+     main = paste0("RNA-seq CV RF (AUC = ", round(auc(roc_cv), 3), ")"))
+dev.off()
+
+cat("\nComparison:\n")
+cat("  Top-50-DEG RF, NOT cross-validated (leakage-prone): 0.873\n")
+cat("  Top-50-DEG RF, cross-validated (fair):              ", round(auc(roc_cv), 3), "\n")
+cat("  MOFA all 15 factors:                                 0.750\n")
+cat("  MOFA Factors 1+2+3:                                  0.769\n")
+```
+
+
+```{r}
+library(dplyr)
+
+n_deg_total     <- sum(res_df$is_DEG_up, na.rm = TRUE)
+n_snorna_tested <- sum(res_df$is_snoRNA, na.rm = TRUE)
+
+# ── 1. Define snoRNA gene sets ──────────────────────────────────────────────
+# Background = all genes tested in the DE model (res_df), not the whole genome,
+# since untested genes could never have been called DEGs in the first place
+res_df <- res_df %>%
+  mutate(is_snoRNA = grepl("^SNORA|^SNORD|^SCARNA", Gene.name))
+
+res_df <- res_df %>%
+  mutate(is_DEG_up = FDR < 0.05 & logFC > log2(1.5))
+
+# ── 2. Build 2x2 contingency table ──────────────────────────────────────────
+# Rows: snoRNA vs non-snoRNA | Columns: DEG (up) vs not DEG
+contingency <- table(
+  snoRNA = res_df$is_snoRNA,
+  DEG    = res_df$is_DEG_up
+)
+
+print(contingency)
+
+# ── 3. Chi-square test ───────────────────────────────────────────────────────
+chisq_result <- chisq.test(contingency)
+print(chisq_result)
+
+# ── 4. Check expected counts (chi-square assumption: all expected >= 5) ────
+cat("\nExpected counts:\n")
+print(chisq_result$expected)
+
+# If any expected count < 5, Fisher's exact test is more appropriate
+if (any(chisq_result$expected < 5)) {
+  cat("\nWarning: some expected counts < 5 — chi-square approximation may be unreliable.\n")
+  cat("Falling back to Fisher's exact test:\n")
+  fisher_result <- fisher.test(contingency)
+  print(fisher_result)
+}
+
+# ── 5. Summary stats ─────────────────────────────────────────────────────────
+n_snorna_deg    <- sum(res_df$is_snoRNA & res_df$is_DEG_up)
+n_deg_total     <- sum(res_df$is_DEG_up)
+n_snorna_tested <- sum(res_df$is_snoRNA)
+n_tested_total  <- nrow(res_df)
+
+pct_deg_snorna   <- 100 * n_snorna_deg / n_deg_total
+pct_bg_snorna    <- 100 * n_snorna_tested / n_tested_total
+
+cat("\n── Summary ──\n")
+cat("snoRNAs among upregulated DEGs: ", n_snorna_deg, "/", n_deg_total,
+    " (", round(pct_deg_snorna, 1), "%)\n", sep = "")
+cat("snoRNAs among all tested genes: ", n_snorna_tested, "/", n_tested_total,
+    " (", round(pct_bg_snorna, 1), "%)\n", sep = "")
+cat("Fold enrichment: ", round(pct_deg_snorna / pct_bg_snorna, 2), "x\n", sep = "")
+
+```
+
+```{r}
+library(dplyr)
+
+# ── 1. TSS-filtered candidates (read off Figure panels A & B; only PELP1
+# and ZNF423 delta-beta values are confirmed from earlier in this thread —
+# fill in the rest once you can access RRBS_locus_DG_vs_NG.txt /
+# RRBS_gene_level_DG_vs_NG.txt directly) ────────────────────────────────────
+tss_filtered <- data.frame(
+  gene       = c("LINC00682", "CSTF2", "PELP1", "H3C1", "ZNF423",
+                 "SMU1", "UBE2E4P", "IRX4", "LINC01354"),
+  delta_beta = c(NA, NA, 0.088, NA, 0.10,
+                 NA, NA, NA, NA),
+  PValue     = NA_real_,
+  FDR        = NA_real_,
+  direction  = c("Hypo", "Hypo", "Hyper", "Hyper", "Hyper",
+                 "Hyper", "Hyper", "Hyper", "Hyper"),
+  source     = c("TSS locus-level (exploratory)", "TSS locus-level (exploratory)",
+                 "TSS locus-level (exploratory)", "TSS locus-level (exploratory)",
+                 "TSS locus-level + gene-level (primary)", "TSS locus-level (exploratory)",
+                 "TSS locus-level (exploratory)", "TSS gene-level (exploratory)",
+                 "TSS gene-level (exploratory)")
+)
+
+# ── 2. Whole-genome exploratory candidates — full list, hardcoded directly
+# from dml_exploratory_wholegenome.txt (48 loci: 43 hyper, 5 hypo) ──────────
+wg_filtered <- data.frame(
+  gene = c("S100A10","CROCCP3","FGFR2","PDLIM1","CRTAC1","LOC105369509",
+           "OAF","OAF","OAF","OAF","GRAMD1B","LINC01234","PPM1H","ATP11A",
+           "MBNL2","MBNL2","CDH5","LOC105371485","PELP1","CYTH1","LINC01970",
+           "ANO8","LAPTM4A","LAPTM4A","GBX2","LRPPRC","MSH6","KCNQ2","HLCS",
+           "LINC01424","BCL2L13","OGFRP1","LINC00636","VILL","CDC25A","RAD18",
+           "LINC02374","ZFP42","CFAP299","NR2F1-AS1","FAM83A-AS1","FAM83A-AS1",
+           "KBTBD11-OT1","DNAJC5B","MIR8055","LOC101926892","RALGPS1","UNQ6494"),
+  delta_beta = c(0.1786673,0.0658881,0.1003922,0.0927014,0.0930926,0.1447595,
+                 0.1581512,0.1673264,0.1464119,0.1662389,0.0943406,0.1426029,
+                 0.1347748,-0.1132179,0.1220984,0.1504201,0.1931537,0.1787610,
+                 0.1203571,0.1428903,0.1116022,-0.1575064,0.0611679,0.0904769,
+                 0.1531401,0.0774243,0.1617446,0.1424714,0.0794246,0.2312240,
+                 0.0582721,0.0773780,0.1531674,0.1269485,-0.1246056,0.1627953,
+                 0.1263904,0.1855893,0.1350595,0.1594606,0.1168616,0.1236535,
+                 0.0980484,-0.1476910,-0.0812841,0.1052451,0.0858787,0.2017944),
+  PValue = c(0.0006797,0.0009258,0.0007340,0.0006388,0.0008428,0.0004245,
+             0.0000681,0.0000584,0.0000987,0.0001942,0.0004118,0.0007074,
+             0.0005422,0.0007757,0.0000690,0.0000226,0.0000233,0.0006619,
+             0.0001442,0.0003776,0.0001143,0.0004920,0.0003446,0.0005360,
+             0.0007096,0.0004372,0.0003874,0.0000767,0.0001617,0.0004739,
+             0.0009016,0.0000800,0.0000918,0.0008229,0.0007412,0.0008259,
+             0.0002025,0.0001020,0.0003266,0.0006677,0.0005007,0.0007297,
+             0.0004791,0.0006030,0.0003167,0.0003597,0.0002375,0.0006420),
+  FDR = c(0.6531798,0.6743415,0.6531798,0.6531798,0.6531798,0.6423066,
+          0.5380918,0.5380918,0.5401654,0.5574120,0.6423066,0.6531798,
+          0.6531798,0.6531798,0.5380918,0.3971365,0.3971365,0.6531798,
+          0.5401654,0.6423066,0.5401654,0.6515627,0.6407444,0.6531798,
+          0.6531798,0.6442671,0.6423066,0.5380918,0.5401654,0.6442671,
+          0.6621912,0.5380918,0.5401654,0.6531798,0.6531798,0.6531798,
+          0.5574120,0.5401654,0.6407444,0.6531798,0.6531798,0.6531798,
+          0.6442671,0.6531798,0.6407444,0.6415295,0.5852835,0.6531798)
+) %>%
+  mutate(direction = ifelse(delta_beta > 0, "Hyper", "Hypo"),
+         source    = "Whole-genome locus-level (exploratory)")
+
+# ── 3. Combine, deduplicate (keep most significant record per gene) ────────
+candidate_dml_genes <- bind_rows(tss_filtered, wg_filtered) %>%
+  group_by(gene) %>%
+  slice_min(order_by = coalesce(PValue, Inf), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Total unique candidate DML genes (TSS-filtered + whole-genome):",
+    nrow(candidate_dml_genes), "\n\n")
+print(candidate_dml_genes, n = Inf)
+
+# ── 4. Cross-reference against RNA-seq DEGs ─────────────────────────────────
+rnaseq_lookup <- res_df %>%
+  filter(Gene.name %in% candidate_dml_genes$gene) %>%
+  dplyr::select(gene = Gene.name, logFC, FDR_rna = FDR) %>%
+  mutate(is_DEG = FDR_rna < 0.05 & abs(logFC) > log2(1.5))
+
+merged <- candidate_dml_genes %>%
+  left_join(rnaseq_lookup, by = "gene")
+
+cat("\nCandidate DML genes with a matching RNA-seq record:",
+    sum(!is.na(merged$logFC)), "/", nrow(merged), "\n")
+cat("Of these, formal DEGs (FDR<0.05, |FC|>1.5):",
+    sum(merged$is_DEG, na.rm = TRUE), "\n\n")
+
+print(merged %>% arrange(desc(is_DEG), delta_beta), n = Inf)
+```
+
+## ── snoRNA artefact diagnostics (Tim's comment) ────────────────────────────
+
+```{r}
+
+## (i) Library size / composition check — RIN not present in your clinical
+## metadata, so this uses library size and % of reads mapping to snoRNA
+## biotypes as the available proxies for RNA degradation/capture bias.
+
+lib_size_df <- data.frame(
+  subject   = y$samples$subject,
+  group     = y$samples$group,
+  lib_size  = y$samples$lib.size
+)
+
+cat("Library size by group:\n")
+print(tapply(lib_size_df$lib_size, lib_size_df$group, summary))
+
+wilcox_libsize <- wilcox.test(lib_size ~ group, data = lib_size_df)
+cat("\nWilcoxon test, library size DG vs NG: p =", format(wilcox_libsize$p.value, digits = 3), "\n")
+
+ggplot(lib_size_df, aes(x = group, y = lib_size, fill = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.7) +
+  geom_jitter(aes(colour = group), width = 0.12, size = 2.5, alpha = 0.85) +
+  scale_fill_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  labs(title = "Library size by group", x = NULL, y = "Library size (total counts)") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+ggsave("11.06.run/libsize_by_group.pdf", width = 5, height = 5)
+
+## % of total library mapping to snoRNA/snRNA/scaRNA biotypes per sample —
+## a rise in this percentage in one group is a classic degraded-RNA /
+## capture-bias signature, independent of any single gene's fold-change.
+
+snorna_ensembl <- res_df$Row.names[grepl("^SNORA|^SNORD|^SCARNA", res_df$Gene.name)]
+# adjust the ID column name above if res_df's ENSEMBL IDs live in rownames
+# instead of a Row.names column — check with head(res_df) first
+
+raw_counts <- y$counts
+pct_snorna <- data.frame(
+  subject    = y$samples$subject,
+  group      = y$samples$group,
+  pct_snorna = 100 * colSums(raw_counts[rownames(raw_counts) %in% snorna_ensembl, ]) /
+                     colSums(raw_counts)
+)
+
+cat("\n% of library mapping to snoRNA/snRNA/scaRNA biotypes, by group:\n")
+print(tapply(pct_snorna$pct_snorna, pct_snorna$group, summary))
+
+wilcox_pctsnorna <- wilcox.test(pct_snorna ~ group, data = pct_snorna)
+cat("\nWilcoxon test, %snoRNA reads DG vs NG: p =", format(wilcox_pctsnorna$p.value, digits = 3), "\n")
+
+ggplot(pct_snorna, aes(x = group, y = pct_snorna, fill = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.7) +
+  geom_jitter(aes(colour = group), width = 0.12, size = 2.5, alpha = 0.85) +
+  scale_fill_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  labs(title = "% library mapping to snoRNA/snRNA/scaRNA biotypes",
+       x = NULL, y = "% of total library") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+ggsave("11.06.run/pct_snorna_by_group.pdf", width = 5, height = 5)
+
+
+## (ii) Is the signal driven by a handful of outlier samples? ───────────────
+## Reuses your existing logcpm object and top DEG list, styled like your
+## SNORA26 boxplot chunk further down in the notebook.
+
+top_snorna_genes <- res_df %>%
+  filter(FDR < 0.05 & logFC > log2(1.5)) %>%
+  filter(grepl("^SNORA|^SNORD|^SCARNA", Gene.name)) %>%
+  arrange(FDR) %>%
+  slice_head(n = 6) %>%
+  pull(Gene.name)
+
+logcpm <- cpm(y, log = TRUE, prior.count = 1)
+
+snorna_long <- res_df %>%
+  filter(Gene.name %in% top_snorna_genes) %>%
+  pull(Gene.name)
+
+# match Gene.name back to rownames of logcpm via res_df
+gene_to_id <- setNames(rownames(res_df), res_df$Gene.name)
+snorna_ids <- gene_to_id[top_snorna_genes]
+
+snorna_expr <- as.data.frame(t(logcpm[snorna_ids, ]))
+colnames(snorna_expr) <- top_snorna_genes
+snorna_expr$subject <- y$samples$subject
+snorna_expr$group   <- y$samples$group
+
+snorna_long_df <- snorna_expr %>%
+  tidyr::pivot_longer(cols = all_of(top_snorna_genes),
+                      names_to = "gene", values_to = "logCPM")
+
+ggplot(snorna_long_df, aes(x = group, y = logCPM)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, alpha = 0.5) +
+  geom_jitter(aes(colour = group), width = 0.12, size = 2, alpha = 0.85) +
+  facet_wrap(~gene, scales = "free_y") +
+  scale_colour_manual(values = c("DG" = "#D94F3D", "NG" = "#4C72B0")) +
+  labs(title = "Per-sample expression of top upregulated snoRNAs",
+       x = NULL, y = "log2-CPM") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave("11.06.run/snorna_per_sample_outlier_check.pdf", width = 9, height = 6)
+
+
+## (iii) Does the enrichment persist after excluding snoRNA/snRNA/scaRNA
+## biotypes from the DE model entirely? ──────────────────────────────────
+## Re-runs your Section 3/8 pipeline (filter → normalise → fit → LRT)
+## on a biotype-excluded gene set, for direct comparison against res_df.
+
+is_snorna_biotype <- grepl("^SNORA|^SNORD|^SCARNA", genes[rownames(y), "Gene.name"])
+cat("\nGenes flagged as snoRNA/snRNA/scaRNA biotype in filtered set:",
+    sum(is_snorna_biotype), "\n")
+
+y_nosnorna <- y[!is_snorna_biotype, ]
+y_nosnorna <- calcNormFactors(y_nosnorna)
+
+design_nosnorna <- model.matrix(~0 + y_nosnorna$samples$group)
+colnames(design_nosnorna) <- c("DG", "NG")
+
+y_nosnorna   <- estimateDisp(y_nosnorna, design_nosnorna)
+fit_nosnorna <- glmFit(y_nosnorna, design_nosnorna)
+lrt_nosnorna <- glmLRT(fit_nosnorna, contrast = c(1, -1))
+
+res_nosnorna <- as.data.frame(topTags(lrt_nosnorna, n = Inf)$table)
+
+deg_nosnorna <- res_nosnorna %>% filter(FDR < 0.05 & abs(logFC) > log2(1.5))
+cat("DEGs after excluding snoRNA/snRNA/scaRNA biotypes:", nrow(deg_nosnorna), "\n")
+cat("  Upregulated:  ", sum(deg_nosnorna$logFC > 0), "\n")
+cat("  Downregulated:", sum(deg_nosnorna$logFC < 0), "\n")
+
+## Check whether your other headline DEGs are stable without snoRNAs
+headline_genes <- c("PPARGC1A", "FGFR2", "ADIPOQ", "INSR", "IRS1")
+cat("\nHeadline gene stability check (with vs without snoRNA biotypes):\n")
+for (g in headline_genes) {
+  with_row    <- res_df[res_df$Gene.name %in% g, c("logFC", "FDR")]
+  without_row <- res_nosnorna[res_nosnorna$Gene.name %in% g, c("logFC", "FDR")]
+
+  # Guard in case a gene genuinely has zero or >1 matches
+  if (nrow(with_row) != 1 || nrow(without_row) != 1) {
+    cat(sprintf("  %-10s  WARNING: %d match(es) in res_df, %d match(es) in res_nosnorna — skipping\n",
+                g, nrow(with_row), nrow(without_row)))
+    next
+  }
+
+  cat(sprintf("  %-10s  with: logFC=%.3f FDR=%.2e  |  without: logFC=%.3f FDR=%.2e\n",
+              g, with_row$logFC, with_row$FDR, without_row$logFC, without_row$FDR))
+}
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# ── Use corrected threshold ────────────────────────────────────────────────
+sig_up   <- res_df[res_df$FDR < 0.05 & res_df$logFC > 0, ]
+sig_down <- res_df[res_df$FDR < 0.05 & res_df$logFC < 0, ]
+
+cat("Upregulated DEGs:  ", nrow(sig_up), "\n")
+cat("Downregulated DEGs:", nrow(sig_down), "\n")
+
+# ── Map ENSEMBL to Entrez ─────────────────────────────────────────────────
+map_entrez <- function(df) {
+  df$ENSEMBL <- rownames(df)
+  entrez <- bitr(df$ENSEMBL, fromType = "ENSEMBL",
+                 toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  merge(df, entrez, by = "ENSEMBL")
+}
+
+up_mapped   <- map_entrez(sig_up)
+down_mapped <- map_entrez(sig_down)
+
+# ── KEGG enrichment ───────────────────────────────────────────────────────
+kegg_up <- enrichKEGG(gene = up_mapped$ENTREZID, organism = "hsa",
+                      pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+
+kegg_down <- enrichKEGG(gene = down_mapped$ENTREZID, organism = "hsa",
+                        pvalueCutoff = 0.05, qvalueCutoff = 0.2)
+
+# ── GO:BP enrichment ──────────────────────────────────────────────────────
+go_up <- enrichGO(gene = up_mapped$ENTREZID, OrgDb = org.Hs.eg.db,
+                  ont = "BP", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+                  readable = TRUE)
+
+go_down <- enrichGO(gene = down_mapped$ENTREZID, OrgDb = org.Hs.eg.db,
+                    ont = "BP", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+                    readable = TRUE)
+
+# ── Semantic redundancy reduction for GO:BP ────────────────────────────────
+# GO's ontology structure means parent/child/sibling terms describing the
+# same underlying biology (e.g. "cellular respiration" and "aerobic
+# respiration") frequently all pass significance together. simplify()
+# collapses these to representative terms using semantic similarity
+# (cutoff = 0.7 is clusterProfiler's standard default), keeping the term
+# with the lowest p.adjust from each redundant cluster. This is applied
+# to GO only — KEGG has no equivalent hierarchy/similarity structure to
+# collapse on, so its redundancy (see note below) is handled separately.
+go_up_simplified   <- clusterProfiler::simplify(go_up,   cutoff = 0.7, by = "p.adjust", select_fun = min)
+go_down_simplified <- clusterProfiler::simplify(go_down, cutoff = 0.7, by = "p.adjust", select_fun = min)
+
+cat("\nGO:BP Upregulated — before simplify():", nrow(as.data.frame(go_up)),
+    "| after:", nrow(as.data.frame(go_up_simplified)), "terms\n")
+cat("GO:BP Downregulated — before simplify():", nrow(as.data.frame(go_down)),
+    "| after:", nrow(as.data.frame(go_down_simplified)), "terms\n")
+
+# ── KEGG redundancy flag: MHC class II gene module ─────────────────────────
+# Several KEGG "disease" pathways (Systemic lupus erythematosus, Type I
+# diabetes mellitus, Leishmaniasis, Toxoplasmosis, Viral myocarditis, etc.)
+# are populated almost entirely by the same HLA-DR/DP/DQ gene set, since
+# KEGG catalogues antigen-presentation genes under disease-pathway names
+# rather than a single generic "MHC class II presentation" term. These are
+# NOT five independent biological signals — flag rather than silently plot
+# all of them as if they were.
+mhc_genes <- c("HLA-DPA1", "HLA-DPB1", "HLA-DQB1", "HLA-DRA", "HLA-DRB1", "HLA-DRB5")
+
+kegg_up_df <- as.data.frame(kegg_up)
+kegg_up_df$mhc_driven <- sapply(strsplit(kegg_up_df$geneID, "/"), function(entrez_ids) {
+  syms <- mapIds(org.Hs.eg.db, keys = entrez_ids, column = "SYMBOL",
+                 keytype = "ENTREZID", multiVals = "first")
+  mean(syms %in% mhc_genes) > 0.5   # >50% of the pathway's genes are MHC-II
+})
+
+cat("\nKEGG Upregulated pathways flagged as MHC class II-driven (>50% overlap):\n")
+print(kegg_up_df$Description[kegg_up_df$mhc_driven])
+
+# ── Print summaries ───────────────────────────────────────────────────────
+cat("\nKEGG - Upregulated:", nrow(as.data.frame(kegg_up)), "pathways\n")
+cat("KEGG - Downregulated:", nrow(as.data.frame(kegg_down)), "pathways\n")
+cat("GO:BP - Upregulated (simplified):", nrow(as.data.frame(go_up_simplified)), "terms\n")
+cat("GO:BP - Downregulated (simplified):", nrow(as.data.frame(go_down_simplified)), "terms\n")
+
+# ── Export ────────────────────────────────────────────────────────────────
+write.table(kegg_up_df,                             "11.06.run/KEGG_upregulated.txt",    sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(kegg_down),                "11.06.run/KEGG_downregulated.txt",  sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(go_up_simplified),          "11.06.run/GO_BP_upregulated_simplified.txt",   sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(go_down_simplified),        "11.06.run/GO_BP_downregulated_simplified.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+```{r}
+library(enrichplot)
+
+p_kegg_up_dot <- dotplot(kegg_up, showCategory = 15, color = "p.adjust") +
+  ggtitle("KEGG — Upregulated (DG vs NG)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+p_kegg_down_dot <- dotplot(kegg_down, showCategory = 15, color = "p.adjust") +
+  ggtitle("KEGG — Downregulated (DG vs NG)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_kegg_up_dot)
+print(p_kegg_down_dot)
+
+ggsave("11.06.run/KEGG_dotplot_up.pdf", p_kegg_up_dot, width = 8, height = 7)
+ggsave("11.06.run/KEGG_dotplot_down.pdf", p_kegg_down_dot, width = 8, height = 7)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+kegg_combined <- bind_rows(
+  as.data.frame(kegg_up)   %>% mutate(direction = "Upregulated"),
+  as.data.frame(kegg_down) %>% mutate(direction = "Downregulated")
+) %>%
+  group_by(direction) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>%
+  mutate(
+    Description = str_wrap(Description, width = 45),
+    gene_ratio  = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2])),
+    gene_count  = as.numeric(sub("/.*", "", GeneRatio)),
+    Description = factor(Description, levels = rev(unique(Description[order(direction, p.adjust)])))
+  )
+
+p_kegg_dot <- ggplot(kegg_combined, aes(x = gene_ratio, y = Description)) +
+  geom_point(aes(size = gene_count, colour = direction), alpha = 0.85) +
+  facet_wrap(~direction, scales = "free_y") +
+  scale_colour_manual(values = c("Upregulated" = DG_COL, "Downregulated" = NG_COL), name = NULL) +
+  scale_size_continuous(name = "Gene count", range = c(3, 9)) +
+  labs(title = "KEGG pathway enrichment — DG vs NG",
+       x = "Gene ratio", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "#2C3E50", colour = NA),
+    strip.text        = element_text(colour = "white", face = "bold"),
+    plot.title         = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.y          = element_text(size = 9),
+    legend.position        = "right"
+  )
+
+print(p_kegg_dot)
+ggsave("11.06.run/KEGG_dotplot_combined.pdf", p_kegg_dot, width = 12, height = 7)
+```
